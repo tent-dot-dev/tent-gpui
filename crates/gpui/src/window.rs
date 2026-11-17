@@ -1216,6 +1216,10 @@ enum InputModality {
     Touch,
 }
 
+/// How many bytes of images a window uploads to its atlas in one frame before it
+/// leaves the rest for the next frame. The image that crosses the line is still uploaded.
+const IMAGE_UPLOAD_BYTES_PER_FRAME: usize = 8 * 1024 * 1024;
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1227,6 +1231,7 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    image_bytes_uploaded_this_frame: usize,
     text_system: Rc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -2358,6 +2363,7 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            image_bytes_uploaded_this_frame: 0,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -3668,6 +3674,7 @@ impl Window {
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        self.image_bytes_uploaded_this_frame = 0;
 
         if self.platform_window.prepare_frame() {
             self.refresh();
@@ -5324,18 +5331,29 @@ impl Window {
             frame_index,
         };
 
+        // Uploading an image to the atlas happens on the main thread and costs about a
+        // millisecond per 5 MB. When many images finish loading together, spread their
+        // uploads over frames instead of stalling one: past the budget, leave the image
+        // out of this frame and ask for another.
+        let over_budget = self.image_bytes_uploaded_this_frame >= IMAGE_UPLOAD_BYTES_PER_FRAME;
+        let mut uploaded = 0;
         let tile = self
             .sprite_atlas
             .get_or_insert_with(params.into(), &mut || {
-                Ok(Some((
-                    data.size(frame_index),
-                    Cow::Borrowed(
-                        data.as_bytes(frame_index)
-                            .expect("It's the caller's job to pass a valid frame index"),
-                    ),
-                )))
-            })?
-            .expect("Callback above only returns Some");
+                if over_budget {
+                    return Ok(None);
+                }
+                let bytes = data
+                    .as_bytes(frame_index)
+                    .expect("It's the caller's job to pass a valid frame index");
+                uploaded = bytes.len();
+                Ok(Some((data.size(frame_index), Cow::Borrowed(bytes))))
+            })?;
+        self.image_bytes_uploaded_this_frame += uploaded;
+        let Some(tile) = tile else {
+            self.request_animation_frame();
+            return Ok(());
+        };
 
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
