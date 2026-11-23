@@ -475,13 +475,16 @@ impl WrappedLineLayout {
     }
 }
 
+const MAX_WARM_LINES: usize = 4096;
+const MAX_WARM_WRAPPED_LINES: usize = 4096;
+
 pub(crate) struct LineLayoutCache {
     state: RefCell<LineLayoutCacheState>,
     wrap_scratch: RefCell<WrapScratch>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
     /// Advances when [`TextSystem::add_fonts`] successfully changes the font database.
     font_generation: Arc<AtomicUsize>,
-    /// Records the generation represented by both frame caches.
+    /// Records the generation represented by all cached layouts.
     cached_font_generation: AtomicUsize,
 }
 
@@ -495,6 +498,40 @@ struct WrapScratch {
 struct LineLayoutCacheState {
     previous_frame: FrameCache,
     current_frame: FrameCache,
+    warm_lines: WarmLayouts<LineLayout>,
+    warm_wrapped_lines: WarmLayouts<WrappedLineLayout>,
+    warm_clock: u64,
+}
+
+type WarmLayouts<Layout> = FxHashMap<Arc<CacheKey>, (Arc<Layout>, u64)>;
+
+fn retain_unused_layouts<Layout>(
+    previous: &mut FxHashMap<Arc<CacheKey>, Arc<Layout>>,
+    warm: &mut WarmLayouts<Layout>,
+    clock: &mut u64,
+    capacity: usize,
+) {
+    if previous.is_empty() {
+        return;
+    }
+
+    // A layout reaches this tier only after a frame without a hit. Layouts from
+    // the same frame have equal recency, so the drain order breaks ties.
+    let previous_len = previous.len();
+    if previous_len >= capacity {
+        warm.clear();
+    }
+    for (key, layout) in previous.drain().skip(previous_len.saturating_sub(capacity)) {
+        *clock += 1;
+        warm.insert(key, (layout, *clock));
+    }
+
+    if warm.len() > capacity {
+        let excess = warm.len() - capacity;
+        let mut stamps: Vec<_> = warm.values().map(|(_, stamp)| *stamp).collect();
+        let (_, cutoff, _) = stamps.select_nth_unstable(excess - 1);
+        warm.retain(|_, (_, stamp)| *stamp > *cutoff);
+    }
 }
 
 #[derive(Default)]
@@ -549,6 +586,7 @@ impl LineLayoutCache {
         let LineLayoutCacheState {
             previous_frame,
             current_frame,
+            ..
         } = &mut *state;
 
         for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
@@ -586,10 +624,23 @@ impl LineLayoutCache {
         let LineLayoutCacheState {
             previous_frame,
             current_frame,
+            warm_lines,
+            warm_wrapped_lines,
+            warm_clock,
         } = &mut *self.state.borrow_mut();
+        retain_unused_layouts(
+            &mut previous_frame.lines,
+            warm_lines,
+            warm_clock,
+            MAX_WARM_LINES,
+        );
+        retain_unused_layouts(
+            &mut previous_frame.wrapped_lines,
+            warm_wrapped_lines,
+            warm_clock,
+            MAX_WARM_WRAPPED_LINES,
+        );
         std::mem::swap(previous_frame, current_frame);
-        current_frame.lines.clear();
-        current_frame.wrapped_lines.clear();
         current_frame.used_lines.clear();
         current_frame.used_wrapped_lines.clear();
     }
@@ -607,11 +658,12 @@ impl LineLayoutCache {
         SharedString: From<Text>,
     {
         let _font_generation = self.clear_if_font_generation_changed();
+        let wrap = wrap_width.map(|width| (width, max_lines));
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
             runs,
-            wrap_width,
+            wrap,
             force_width: None,
         } as &dyn AsCacheKeyRef;
 
@@ -622,8 +674,17 @@ impl LineLayoutCache {
         drop(state);
 
         let mut state = self.state.borrow_mut();
-        let previous_frame_entry = state.previous_frame.wrapped_lines.remove_entry(key);
-        if let Some((key, layout)) = previous_frame_entry {
+        let cached_entry = state
+            .previous_frame
+            .wrapped_lines
+            .remove_entry(key)
+            .or_else(|| {
+                state
+                    .warm_wrapped_lines
+                    .remove_entry(key)
+                    .map(|(key, (layout, _))| (key, layout))
+            });
+        if let Some((key, layout)) = cached_entry {
             state
                 .current_frame
                 .wrapped_lines
@@ -653,7 +714,7 @@ impl LineLayoutCache {
                 text,
                 font_size,
                 runs: SmallVec::from(runs),
-                wrap_width,
+                wrap,
                 force_width: None,
             });
 
@@ -684,7 +745,7 @@ impl LineLayoutCache {
             text: text.as_ref(),
             font_size,
             runs,
-            wrap_width: None,
+            wrap: None,
             force_width,
         } as &dyn AsCacheKeyRef;
 
@@ -698,8 +759,15 @@ impl LineLayoutCache {
         let LineLayoutCacheState {
             previous_frame,
             current_frame,
+            warm_lines,
+            ..
         } = &mut *state;
-        if let Some((key, layout)) = previous_frame.lines.remove_entry(key) {
+        let cached_entry = previous_frame.lines.remove_entry(key).or_else(|| {
+            warm_lines
+                .remove_entry(key)
+                .map(|(key, (layout, _))| (key, layout))
+        });
+        if let Some((key, layout)) = cached_entry {
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
@@ -717,7 +785,7 @@ impl LineLayoutCache {
                 text,
                 font_size,
                 runs: SmallVec::from(runs),
-                wrap_width: None,
+                wrap: None,
                 force_width,
             });
             let layout = Arc::new(layout);
@@ -792,7 +860,7 @@ struct CacheKey {
     text: SharedString,
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
-    wrap_width: Option<Pixels>,
+    wrap: Option<(Pixels, Option<usize>)>,
     force_width: Option<Pixels>,
 }
 
@@ -801,7 +869,7 @@ struct CacheKeyRef<'a> {
     text: &'a str,
     font_size: Pixels,
     runs: &'a [FontRun],
-    wrap_width: Option<Pixels>,
+    wrap: Option<(Pixels, Option<usize>)>,
     force_width: Option<Pixels>,
 }
 
@@ -825,7 +893,7 @@ impl AsCacheKeyRef for CacheKey {
             text: &self.text,
             font_size: self.font_size,
             runs: self.runs.as_slice(),
-            wrap_width: self.wrap_width,
+            wrap: self.wrap,
             force_width: self.force_width,
         }
     }
@@ -858,7 +926,254 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GlyphId;
+    use crate::{
+        Bounds, DevicePixels, Font, FontMetrics, NoopTextSystem, RenderGlyphParams,
+        TextRenderingMode,
+    };
+    use anyhow::Result;
+    use std::borrow::Cow;
+
+    #[derive(Default)]
+    struct CountingTextSystem {
+        shapes: AtomicUsize,
+    }
+
+    impl PlatformTextSystem for CountingTextSystem {
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            NoopTextSystem.add_fonts(fonts)
+        }
+
+        fn all_font_names(&self) -> Vec<String> {
+            NoopTextSystem.all_font_names()
+        }
+
+        fn font_id(&self, font: &Font) -> Result<FontId> {
+            NoopTextSystem.font_id(font)
+        }
+
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            NoopTextSystem.font_metrics(font_id)
+        }
+
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            NoopTextSystem.typographic_bounds(font_id, glyph_id)
+        }
+
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            NoopTextSystem.advance(font_id, glyph_id)
+        }
+
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            NoopTextSystem.glyph_for_char(font_id, ch)
+        }
+
+        fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            NoopTextSystem.glyph_raster_bounds(params)
+        }
+
+        fn rasterize_glyph(
+            &self,
+            params: &RenderGlyphParams,
+            raster_bounds: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            NoopTextSystem.rasterize_glyph(params, raster_bounds)
+        }
+
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            self.shapes.fetch_add(1, Ordering::Relaxed);
+            NoopTextSystem.layout_line(text, font_size, runs)
+        }
+
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> TextRenderingMode {
+            NoopTextSystem.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    fn counting_cache() -> (LineLayoutCache, Arc<CountingTextSystem>) {
+        let text_system = Arc::new(CountingTextSystem::default());
+        let cache = LineLayoutCache::new(text_system.clone(), Arc::default());
+        (cache, text_system)
+    }
+
+    fn layout_pair(
+        cache: &LineLayoutCache,
+        text: &str,
+    ) -> (Arc<LineLayout>, Arc<WrappedLineLayout>) {
+        (
+            cache.layout_line(text, px(16.), &[], None),
+            cache.layout_wrapped_line(text, px(16.), &[], Some(px(40.)), None),
+        )
+    }
+
+    #[test]
+    fn retains_unused_line_across_frames() {
+        let (cache, text_system) = counting_cache();
+        let layout = cache.layout_line("cached line", px(16.), &[], None);
+        for _ in 0..6 {
+            cache.finish_frame();
+        }
+        let reused = cache.layout_line("cached line", px(16.), &[], None);
+
+        assert!(Arc::ptr_eq(&layout, &reused));
+        assert_eq!(text_system.shapes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retains_unused_wrapped_line_across_frames() {
+        let (cache, text_system) = counting_cache();
+        let text = "a line with several words";
+        let layout = cache.layout_wrapped_line(text, px(16.), &[], Some(px(40.)), None);
+        assert!(!layout.wrap_boundaries().is_empty());
+        for _ in 0..6 {
+            cache.finish_frame();
+        }
+        let reused = cache.layout_wrapped_line(text, px(16.), &[], Some(px(40.)), None);
+
+        assert!(Arc::ptr_eq(&layout, &reused));
+        assert_eq!(text_system.shapes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn wrapped_cache_distinguishes_line_clamps() {
+        let (cache, text_system) = counting_cache();
+        let text = "a line with several words";
+        let width = Some(px(40.));
+        let clamped = cache.layout_wrapped_line(text, px(16.), &[], width, Some(1));
+        cache.finish_frame();
+        cache.finish_frame();
+
+        let unclamped = cache.layout_wrapped_line(text, px(16.), &[], width, None);
+        let reused = cache.layout_wrapped_line(text, px(16.), &[], width, Some(1));
+
+        assert!(clamped.wrap_boundaries().is_empty());
+        assert!(!unclamped.wrap_boundaries().is_empty());
+        assert!(Arc::ptr_eq(&clamped, &reused));
+        assert_eq!(text_system.shapes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn warm_caches_evict_least_recently_used_layouts() {
+        let (cache, text_system) = counting_cache();
+        let (refreshed_line, refreshed_wrapped) = layout_pair(&cache, "refreshed line");
+        cache.finish_frame();
+        let (old_line, old_wrapped) = layout_pair(&cache, "old line");
+        cache.finish_frame();
+        cache.finish_frame();
+
+        let (line, wrapped) = layout_pair(&cache, "refreshed line");
+        assert!(Arc::ptr_eq(&refreshed_line, &line));
+        assert!(Arc::ptr_eq(&refreshed_wrapped, &wrapped));
+        cache.finish_frame();
+        cache.finish_frame();
+
+        for index in 1..MAX_WARM_LINES {
+            cache.layout_line(format!("line {index}"), px(16.), &[], None);
+        }
+        for index in 1..MAX_WARM_WRAPPED_LINES {
+            cache.layout_wrapped_line(format!("line {index}"), px(16.), &[], Some(px(40.)), None);
+        }
+        cache.finish_frame();
+        cache.finish_frame();
+
+        let state = cache.state.borrow();
+        assert_eq!(state.warm_lines.len(), MAX_WARM_LINES);
+        assert_eq!(state.warm_wrapped_lines.len(), MAX_WARM_WRAPPED_LINES);
+        drop(state);
+
+        let shapes = text_system.shapes.load(Ordering::Relaxed);
+        let (line, wrapped) = layout_pair(&cache, "refreshed line");
+        assert!(Arc::ptr_eq(&refreshed_line, &line));
+        assert!(Arc::ptr_eq(&refreshed_wrapped, &wrapped));
+        assert_eq!(text_system.shapes.load(Ordering::Relaxed), shapes);
+
+        let (line, wrapped) = layout_pair(&cache, "old line");
+        assert!(!Arc::ptr_eq(&old_line, &line));
+        assert!(!Arc::ptr_eq(&old_wrapped, &wrapped));
+        assert_eq!(text_system.shapes.load(Ordering::Relaxed), shapes + 1);
+    }
+
+    #[test]
+    fn replays_layout_ranges_after_warm_hits_and_truncation() {
+        let (cache, text_system) = counting_cache();
+        let (line, wrapped) = layout_pair(&cache, "cached view");
+        cache.finish_frame();
+        cache.finish_frame();
+
+        cache.layout_line("prefix", px(16.), &[], None);
+        let start = cache.layout_index();
+        let (warm_line, warm_wrapped) = layout_pair(&cache, "cached view");
+        assert!(Arc::ptr_eq(&line, &warm_line));
+        assert!(Arc::ptr_eq(&wrapped, &warm_wrapped));
+        let end = cache.layout_index();
+        layout_pair(&cache, "discarded view");
+        cache.truncate_layouts(end.clone());
+        assert_eq!(cache.layout_index().lines_index, 2);
+        assert_eq!(cache.layout_index().wrapped_lines_index, 1);
+        cache.finish_frame();
+
+        let mut range = start..end;
+        for text in ["next prefix", "another prefix"] {
+            layout_pair(&cache, text);
+            let start = cache.layout_index();
+            cache.reuse_layouts(range.clone());
+            let second_start = cache.layout_index();
+            cache.reuse_layouts(range);
+            let end = cache.layout_index();
+            assert_eq!(end.lines_index, start.lines_index + 2);
+            assert_eq!(end.wrapped_lines_index, start.wrapped_lines_index + 2);
+            let state = cache.state.borrow();
+            let frame = &state.current_frame;
+            assert!(Arc::ptr_eq(
+                &frame.lines[&frame.used_lines[start.lines_index]],
+                &line
+            ));
+            assert!(Arc::ptr_eq(
+                &frame.wrapped_lines[&frame.used_wrapped_lines[start.wrapped_lines_index]],
+                &wrapped,
+            ));
+            drop(state);
+
+            // Replay the second copy next frame to exercise indexing after a duplicate hit.
+            range = second_start..end;
+            cache.finish_frame();
+        }
+        assert_eq!(text_system.shapes.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn font_generation_invalidates_all_layout_tiers() {
+        let (cache, text_system) = counting_cache();
+        let warm = layout_pair(&cache, "warm line");
+        cache.finish_frame();
+        let previous_start = cache.layout_index();
+        let previous = layout_pair(&cache, "previous line");
+        let previous_end = cache.layout_index();
+        cache.finish_frame();
+        let current = layout_pair(&cache, "current line");
+        assert_eq!(text_system.shapes.load(Ordering::Relaxed), 3);
+
+        cache.font_generation.fetch_add(1, Ordering::Release);
+        cache.reuse_layouts(previous_start..previous_end.clone());
+        cache.truncate_layouts(previous_end);
+        let index = cache.layout_index();
+        assert_eq!(index.lines_index, 0);
+        assert_eq!(index.wrapped_lines_index, 0);
+
+        for (text, (old_line, old_wrapped)) in [
+            ("warm line", warm),
+            ("previous line", previous),
+            ("current line", current),
+        ] {
+            let (line, wrapped) = layout_pair(&cache, text);
+            assert!(!Arc::ptr_eq(&old_line, &line));
+            assert!(!Arc::ptr_eq(&old_wrapped, &wrapped));
+        }
+        assert_eq!(text_system.shapes.load(Ordering::Relaxed), 6);
+    }
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {
