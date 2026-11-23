@@ -2156,6 +2156,12 @@ impl PlatformWindow for MacWindow {
         }
     }
 
+    fn set_high_rate_hint(&self, active: bool) {
+        if let Some(metal_frames) = &self.2 {
+            metal_frames.set_high_rate_hint(active);
+        }
+    }
+
     fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
         let metal_frames = Rc::downgrade(self.2.as_ref()?);
         Some(Rc::new(move || {
@@ -3448,9 +3454,14 @@ fn metal_frame(
     lock.renderer.set_frame_drawable(Some(update.drawable()));
     drop(lock);
     metal_frames.begin_frame();
+    let target_timestamp = update.targetTimestamp();
+    let target_presentation_timestamp = update.targetPresentationTimestamp();
     callback(RequestFrameOptions {
         signal_at,
         signal_source: FrameRequestSource::NativeCallback,
+        target_timestamp: Some(target_timestamp).filter(|time| time.is_finite() && *time > 0.0),
+        target_presentation_timestamp: Some(target_presentation_timestamp)
+            .filter(|time| time.is_finite() && *time > 0.0),
         ..Default::default()
     });
     let mut lock = window_state.lock();

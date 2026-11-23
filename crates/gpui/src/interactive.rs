@@ -533,6 +533,12 @@ pub struct ScrollEvent {
     /// The phase of the scroll gesture.
     pub touch_phase: TouchPhase,
 
+    /// The phase of inertial scrolling, if reported by the platform.
+    pub momentum_phase: Option<TouchPhase>,
+
+    /// The event time in seconds on the platform display-link clock, if available.
+    pub timestamp: Option<f64>,
+
     /// The kind of input that produced this scroll.
     pub source: ScrollSource,
 }
@@ -910,6 +916,13 @@ mod test {
     }
 
     actions!(test_only, [TestAction]);
+
+    #[test]
+    fn scroll_event_defaults_to_no_momentum_or_timestamp() {
+        let event = crate::ScrollEvent::default();
+        assert_eq!(event.momentum_phase, None);
+        assert_eq!(event.timestamp, None);
+    }
 
     impl Render for TestView {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

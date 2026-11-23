@@ -265,6 +265,18 @@ pub(crate) unsafe fn platform_input_from_native(
                     NSEventPhase::Ended => TouchPhase::Ended,
                     _ => TouchPhase::Moved,
                 };
+                let momentum = native_event.momentumPhase();
+                let momentum_phase = if momentum
+                    .intersects(NSEventPhase::Ended | NSEventPhase::Cancelled)
+                {
+                    Some(TouchPhase::Ended)
+                } else if momentum.intersects(NSEventPhase::Began | NSEventPhase::MayBegin) {
+                    Some(TouchPhase::Started)
+                } else if momentum.intersects(NSEventPhase::Changed | NSEventPhase::Stationary) {
+                    Some(TouchPhase::Moved)
+                } else {
+                    None
+                };
 
                 let raw_data = point(
                     native_event.scrollingDeltaX() as f32,
@@ -284,6 +296,8 @@ pub(crate) unsafe fn platform_input_from_native(
                     ),
                     delta,
                     touch_phase: phase,
+                    momentum_phase,
+                    timestamp: Some(native_event.timestamp()),
                     modifiers: read_modifiers(native_event),
                     source: ScrollSource::Pointer,
                 })

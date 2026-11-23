@@ -106,6 +106,7 @@ pub fn scroll_event(recognizer: &UIPanGestureRecognizer, view: &UIView) -> Optio
         modifiers: modifiers(recognizer.modifierFlags()),
         touch_phase,
         source: ScrollSource::Pointer,
+        ..Default::default()
     })
 }
 

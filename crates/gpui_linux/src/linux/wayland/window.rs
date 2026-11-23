@@ -965,6 +965,7 @@ impl WaylandWindowStatePtr {
             require_presentation,
             signal_at,
             signal_source,
+            ..Default::default()
         });
         self.update_ime_enabled();
         drop(callbacks);

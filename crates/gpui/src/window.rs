@@ -17,9 +17,9 @@ use crate::{
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, RequestFrameOptions, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, Task, TextInputConfiguration, TextInputStateChange,
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
     Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
@@ -1262,6 +1262,8 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    target_timestamp: Option<f64>,
+    target_presentation_timestamp: Option<f64>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SingleSubscriberSet<AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SingleSubscriberSet<AnyObserver>,
@@ -1277,6 +1279,7 @@ pub struct Window {
     pub(crate) appearance_observers: SingleSubscriberSet<AnyObserver>,
     pub(crate) button_layout_observers: SingleSubscriberSet<AnyObserver>,
     active: Rc<Cell<bool>>,
+    high_rate_hint: bool,
     visibility: WindowVisibility,
     pub(crate) visibility_observers:
         SingleSubscriberSet<Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
@@ -1934,8 +1937,22 @@ impl Window {
                 let force_render =
                     mem::take(&mut deferred_force_render) || request_frame_options.force_render;
 
+                let high_rate_input = input_rate_tracker.borrow().is_high_rate();
                 let power_state = handle
-                    .update(&mut cx, |_, _, cx| (cx.thermal_state(), cx.power_mode()))
+                    .update(&mut cx, |_, window, cx| {
+                        let thermal_state = cx.thermal_state();
+                        let power_mode = cx.power_mode();
+                        window.set_high_rate_hint(
+                            high_rate_input
+                                && window.active.get()
+                                && power_mode != crate::PowerMode::LowPower
+                                && !matches!(
+                                    thermal_state,
+                                    ThermalState::Serious | ThermalState::Critical
+                                ),
+                        );
+                        (thermal_state, power_mode)
+                    })
                     .with_context(|| {
                         format!(
                             "reading power state for frame request for window {:?}",
@@ -1946,7 +1963,6 @@ impl Window {
 
                 // Keep presenting briefly after high-rate input to prevent display
                 // underclocking, but subject to the same power limits as redraws.
-                let high_rate_input = input_rate_tracker.borrow_mut().is_high_rate();
                 let has_next_frame_callbacks = !next_frame_callbacks.borrow().is_empty();
                 let has_frame_demand = invalidator.is_dirty()
                     || force_render
@@ -2014,9 +2030,11 @@ impl Window {
                 if !pending_next_frame_callbacks.is_empty() {
                     handle
                         .update(&mut cx, |_, window, cx| {
-                            for callback in pending_next_frame_callbacks {
-                                callback(window, cx);
-                            }
+                            window.with_frame_timestamps(request_frame_options, |window| {
+                                for callback in pending_next_frame_callbacks {
+                                    callback(window, cx);
+                                }
+                            });
                         })
                         .with_context(|| {
                             format!(
@@ -2044,7 +2062,10 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
-                                let arena_clear_needed = window.draw(cx);
+                                let arena_clear_needed = window
+                                    .with_frame_timestamps(request_frame_options, |window| {
+                                        window.draw(cx)
+                                    });
                                 window.present();
                                 arena_clear_needed.clear(cx);
                             })
@@ -2189,6 +2210,9 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, cx| {
                         window.active.set(active);
+                        if !active {
+                            window.set_high_rate_hint(false);
+                        }
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -2383,6 +2407,8 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            target_timestamp: None,
+            target_presentation_timestamp: None,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -2401,6 +2427,7 @@ impl Window {
             appearance_observers: SingleSubscriberSet::new(),
             button_layout_observers: SingleSubscriberSet::new(),
             active,
+            high_rate_hint: false,
             visibility,
             visibility_observers: SingleSubscriberSet::new(),
             hovered,
@@ -2922,6 +2949,36 @@ impl Window {
     /// await points in async code.
     pub fn to_async(&self, cx: &App) -> AsyncWindowContext {
         AsyncWindowContext::new_context(cx.to_async(), self.handle)
+    }
+
+    /// The current frame's render target in seconds on the platform display-link clock.
+    pub fn target_timestamp(&self) -> Option<f64> {
+        self.target_timestamp
+    }
+
+    /// The current frame's expected presentation time in seconds on the platform display-link clock.
+    pub fn target_presentation_timestamp(&self) -> Option<f64> {
+        self.target_presentation_timestamp
+    }
+
+    fn with_frame_timestamps<T>(
+        &mut self,
+        options: RequestFrameOptions,
+        run: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.target_timestamp = options.target_timestamp;
+        self.target_presentation_timestamp = options.target_presentation_timestamp;
+        let result = run(self);
+        self.target_timestamp = None;
+        self.target_presentation_timestamp = None;
+        result
+    }
+
+    fn set_high_rate_hint(&mut self, active: bool) {
+        if self.high_rate_hint != active {
+            self.high_rate_hint = active;
+            self.platform_window.set_high_rate_hint(active);
+        }
     }
 
     /// Schedule the given closure to be run directly after the current frame is rendered.
@@ -9028,6 +9085,60 @@ mod tests {
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
         );
+    }
+
+    #[gpui::test]
+    fn test_platform_frame_timestamps_are_available_during_callbacks_and_draw(
+        cx: &mut TestAppContext,
+    ) {
+        type FrameTimestamps = (Option<f64>, Option<f64>);
+
+        struct FrameTimingView(Rc<Cell<FrameTimestamps>>);
+
+        impl Render for FrameTimingView {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.set((
+                    window.target_timestamp(),
+                    window.target_presentation_timestamp(),
+                ));
+                div()
+            }
+        }
+
+        let rendered_timestamps = Rc::new(Cell::new((None, None)));
+        let window = cx.add_window(|_, _| FrameTimingView(rendered_timestamps.clone()));
+        let test_window = cx.test_window(window.into());
+        for expected in [(Some(42.0), Some(42.008)), (None, None)] {
+            let callback_timestamps = Rc::new(Cell::new(None));
+            window
+                .update(cx, |_, window, _| {
+                    let callback_timestamps = callback_timestamps.clone();
+                    window.on_next_frame(move |window, _| {
+                        callback_timestamps.set(Some((
+                            window.target_timestamp(),
+                            window.target_presentation_timestamp(),
+                        )));
+                    });
+                })
+                .unwrap();
+
+            test_window.simulate_frame_request(RequestFrameOptions {
+                require_presentation: true,
+                force_render: true,
+                target_timestamp: expected.0,
+                target_presentation_timestamp: expected.1,
+                ..Default::default()
+            });
+
+            assert_eq!(callback_timestamps.get(), Some(expected));
+            assert_eq!(rendered_timestamps.get(), expected);
+            window
+                .update(cx, |_, window, _| {
+                    assert_eq!(window.target_timestamp(), None);
+                    assert_eq!(window.target_presentation_timestamp(), None);
+                })
+                .unwrap();
+        }
     }
 
     #[gpui::test]

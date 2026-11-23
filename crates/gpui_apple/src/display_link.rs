@@ -5,7 +5,8 @@ use objc2::{
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes};
 use objc2_quartz_core::{
-    CAMetalDisplayLink, CAMetalDisplayLinkDelegate, CAMetalDisplayLinkUpdate, CAMetalLayer,
+    CAFrameRateRange, CAFrameRateRangeDefault, CAMetalDisplayLink, CAMetalDisplayLinkDelegate,
+    CAMetalDisplayLinkUpdate, CAMetalLayer,
 };
 
 struct MetalDisplayLinkDelegateIvars {
@@ -75,8 +76,6 @@ impl MetalFrameSource {
         let delegate = MetalDisplayLinkDelegate::new(main_thread, callback);
         let link = CAMetalDisplayLink::initWithMetalLayer(CAMetalDisplayLink::alloc(), layer);
         link.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-        // The default range follows the display and system power policy:
-        // https://developer.apple.com/documentation/quartzcore/cametaldisplaylink/preferredframeraterange
         // SAFETY: the retained marker confines the source to the main thread,
         // and the main run loop outlives the source.
         unsafe { link.addToRunLoop_forMode(&NSRunLoop::mainRunLoop(), NSRunLoopCommonModes) };
@@ -90,6 +89,24 @@ impl MetalFrameSource {
     /// A paused link delivers no updates and acquires no drawables.
     pub fn set_paused(&self, paused: bool) {
         self.link.setPaused(paused);
+    }
+
+    /// Sets the refresh rate range in hertz, or restores the system default.
+    pub fn set_preferred_frame_rate_range(&self, range: Option<(f32, f32, f32)>) {
+        let range = match range {
+            Some((minimum, maximum, preferred)) => {
+                CAFrameRateRange::new(minimum, maximum, preferred)
+            }
+            // SAFETY: The constant predates CAMetalDisplayLink on all supported platforms.
+            None => unsafe { CAFrameRateRangeDefault },
+        };
+        // The setter is available on every OS version with CAMetalDisplayLink.
+        self.link.setPreferredFrameRateRange(range);
+    }
+
+    /// Sets the preferred presentation latency in frames.
+    pub fn set_preferred_frame_latency(&self, latency: f32) {
+        self.link.setPreferredFrameLatency(latency);
     }
 }
 

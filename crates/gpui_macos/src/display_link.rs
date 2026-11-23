@@ -304,13 +304,37 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
 #[derive(Default)]
 pub struct MetalFrames {
     source: RefCell<Option<MetalFrameSource>>,
+    high_rate_hint: Cell<bool>,
     /// Whether GPUI asked for a frame since the current update began.
     woken: Cell<bool>,
 }
 
 impl MetalFrames {
     pub fn replace(&self, source: Option<MetalFrameSource>) {
+        if let Some(source) = &source {
+            Self::configure_source(source, self.high_rate_hint.get());
+        }
         *self.source.borrow_mut() = source;
+    }
+
+    /// Updates the refresh rate and latency preferences for interactive input.
+    pub fn set_high_rate_hint(&self, active: bool) {
+        if self.high_rate_hint.replace(active) != active
+            && let Ok(source) = self.source.try_borrow()
+            && let Some(source) = source.as_ref()
+        {
+            Self::configure_source(source, active);
+        }
+    }
+
+    fn configure_source(source: &MetalFrameSource, high_rate: bool) {
+        if high_rate {
+            source.set_preferred_frame_rate_range(Some((60.0, 120.0, 120.0)));
+            source.set_preferred_frame_latency(1.0);
+        } else {
+            source.set_preferred_frame_rate_range(None);
+            source.set_preferred_frame_latency(2.0);
+        }
     }
 
     pub fn is_attached(&self) -> bool {
@@ -590,6 +614,23 @@ mod tests {
     use super::*;
     use objc2::AnyThread;
     use objc2_quartz_core::CAMetalDisplayLink;
+
+    #[test]
+    fn metal_frames_retain_high_rate_hint_across_detachment() {
+        let frames = MetalFrames::default();
+        assert!(!frames.high_rate_hint.get());
+
+        frames.set_high_rate_hint(true);
+        assert!(frames.high_rate_hint.get());
+        frames.set_high_rate_hint(true);
+        frames.replace(None);
+        assert!(frames.high_rate_hint.get());
+
+        frames.set_high_rate_hint(false);
+        assert!(!frames.high_rate_hint.get());
+        frames.set_high_rate_hint(false);
+        assert!(!frames.high_rate_hint.get());
+    }
 
     #[test]
     fn metal_frames_pause_only_when_gpui_neither_draws_nor_asks_again() {

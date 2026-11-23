@@ -807,6 +807,7 @@ impl X11Client {
                         force_render: false,
                         signal_at: None,
                         signal_source: FrameRequestSource::NativeCallback,
+                        ..Default::default()
                     });
                 }
             }
@@ -2070,6 +2071,7 @@ impl X11ClientState {
                                 force_render: false,
                                 signal_at: PlatformFrameSignal::capture(|| instant),
                                 signal_source: FrameRequestSource::LocalSchedule,
+                                ..Default::default()
                             });
                         }
                         xcb_connection
@@ -2590,6 +2592,7 @@ fn make_scroll_wheel_event(
         modifiers,
         touch_phase: TouchPhase::default(),
         source: gpui::ScrollSource::Pointer,
+        ..Default::default()
     }
 }
 

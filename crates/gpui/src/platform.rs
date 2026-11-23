@@ -1059,7 +1059,7 @@ pub enum FrameRequestSource {
     LocalSchedule,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Default)]
 #[expect(missing_docs)]
 pub struct RequestFrameOptions {
     /// Whether a presentation is required.
@@ -1074,6 +1074,10 @@ pub struct RequestFrameOptions {
     pub signal_at: Option<Instant>,
     /// Distinguishes native callbacks from local scheduling requests.
     pub signal_source: FrameRequestSource,
+    /// The target render time in seconds on the platform display-link clock.
+    pub target_timestamp: Option<f64>,
+    /// The expected display time in seconds on the platform display-link clock.
+    pub target_presentation_timestamp: Option<f64>,
 }
 
 /// Preserves the first platform frame request time across coalesced notifications.
@@ -1308,6 +1312,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
+    /// Hints that the window would benefit from a higher display refresh rate.
+    fn set_high_rate_hint(&self, _active: bool) {}
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
     /// Registers the callback invoked when [`Self::visibility`] changes. Only
