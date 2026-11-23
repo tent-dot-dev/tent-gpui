@@ -349,8 +349,10 @@ impl ListState {
     }
 
     /// Set the overdraw measurement budget, or pass `None` to measure without a time limit.
-    /// The budget includes time spent laying out visible items, which are always measured.
-    /// A zero budget defers all new overdraw measurements.
+    /// The budget applies only to offscreen overdraw measurement after visible items are laid
+    /// out. Any non-zero budget persists at least one ready unmeasured overdraw item per frame
+    /// so deferred overdraw always makes progress; a zero budget defers all new overdraw
+    /// measurements until raised or cleared.
     pub fn set_overdraw_budget(&self, budget: Option<Duration>) {
         self.0.borrow_mut().overdraw_budget = budget;
     }
@@ -1133,7 +1135,6 @@ impl StateInner {
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutItemsResponse {
-        let layout_budget = self.overdraw_budget.map(|budget| (Instant::now(), budget));
         let old_items = self.items.clone();
         let mut measured_items = VecDeque::new();
         let mut item_layouts = VecDeque::new();
@@ -1167,7 +1168,7 @@ impl StateInner {
 
         let mut cursor = old_items.cursor::<Count>(());
 
-        let forward_height = if layout_budget.is_some() {
+        let forward_height = if self.overdraw_budget.is_some() {
             available_height
         } else {
             available_height + self.overdraw
@@ -1287,16 +1288,18 @@ impl StateInner {
             }
         }
 
+        let overdraw_budget = self.overdraw_budget.map(|budget| (Instant::now(), budget));
         let overdraw_order = match self.scroll_direction {
             ScrollDirection::Up => [ScrollDirection::Up, ScrollDirection::Down],
             _ => [ScrollDirection::Down, ScrollDirection::Up],
         };
+        let mut measured_overdraw = false;
         let mut overdraw_deferred = false;
         for direction in overdraw_order {
             let leading = direction == ScrollDirection::Up;
             let mut overdraw_height = match direction {
                 ScrollDirection::Up if !provisional => scroll_top.offset_in_item,
-                ScrollDirection::Down if layout_budget.is_some() => trailing_overdraw,
+                ScrollDirection::Down if overdraw_budget.is_some() => trailing_overdraw,
                 _ => continue,
             };
             if overdraw_height >= self.overdraw {
@@ -1314,13 +1317,17 @@ impl StateInner {
                 let (item_size, ready) = if let Some(item_size) = item.size() {
                     (item_size, self.is_item_ready(item_index, cx))
                 } else {
-                    if layout_budget.is_some_and(|(start, budget)| start.elapsed() >= budget) {
+                    if let Some((start, budget)) = overdraw_budget
+                        && (budget.is_zero() || (measured_overdraw && start.elapsed() >= budget))
+                    {
                         overdraw_deferred = true;
                         break;
                     }
                     let mut element = render_item(item_index, window, cx);
                     let item_size = element.layout_as_root(available_item_space, window, cx);
-                    (item_size, self.is_item_ready(item_index, cx))
+                    let ready = self.is_item_ready(item_index, cx);
+                    measured_overdraw |= ready;
+                    (item_size, ready)
                 };
 
                 overdraw_height += item_size.height;
@@ -1969,6 +1976,137 @@ mod test {
         state.scroll_to_end();
         assert_eq!(draw_list_and_record_items(cx, &state, px(20.)), [5, 4]);
         assert_eq!(state.0.borrow().items.summary().rendered_count, 6);
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
+    }
+
+    #[gpui::test]
+    fn test_overdraw_budget_excludes_visible_layout_and_makes_progress(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(6, ListAlignment::Top, px(20.))
+            .with_overdraw_budget(Duration::from_millis(1));
+        state.scroll_to(ListOffset {
+            item_ix: 2,
+            offset_in_item: px(0.),
+        });
+
+        let draw_slow = |cx: &mut VisualTestContext| {
+            let rendered_items = Rc::new(RefCell::new(Vec::new()));
+            cx.draw(
+                point(px(0.), px(0.)),
+                size(px(100.), px(20.)),
+                |_, cx| {
+                    let rendered_items = rendered_items.clone();
+                    let state = state.clone();
+                    struct SlowListView {
+                        state: ListState,
+                        rendered_items: Rc<RefCell<Vec<usize>>>,
+                    }
+                    impl Render for SlowListView {
+                        fn render(
+                            &mut self,
+                            _window: &mut Window,
+                            _cx: &mut Context<Self>,
+                        ) -> impl IntoElement {
+                            let rendered_items = self.rendered_items.clone();
+                            list(self.state.clone(), move |ix, _, _| {
+                                if ix != 3 {
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
+                                rendered_items.borrow_mut().push(ix);
+                                div().h(px(10.)).into_any()
+                            })
+                            .w_full()
+                            .h_full()
+                        }
+                    }
+                    cx.new(|_| SlowListView {
+                        state,
+                        rendered_items,
+                    })
+                    .into_any_element()
+                },
+            );
+            rendered_items.take()
+        };
+
+        assert_eq!(draw_slow(cx), [2, 3, 4]);
+        assert_eq!(state.0.borrow().items.summary().rendered_count, 3);
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 1);
+
+        assert_eq!(draw_slow(cx), [2, 3, 5]);
+        assert_eq!(state.0.borrow().items.summary().rendered_count, 4);
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 1);
+
+        assert_eq!(draw_slow(cx), [2, 3, 1]);
+        assert_eq!(state.0.borrow().items.summary().rendered_count, 5);
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 1);
+
+        assert_eq!(draw_slow(cx), [2, 3, 0]);
+        assert_eq!(state.0.borrow().items.summary().rendered_count, 6);
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
+    }
+
+    #[gpui::test]
+    fn test_overdraw_budget_unready_leading_item_does_not_spin(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(6, ListAlignment::Top, px(20.))
+            .with_overdraw_budget(Duration::from_millis(1));
+        state.set_item_measurement_readiness(|ix, _| ix != 1);
+        state.scroll_to(ListOffset {
+            item_ix: 4,
+            offset_in_item: px(0.),
+        });
+        state.scroll_to(ListOffset {
+            item_ix: 2,
+            offset_in_item: px(0.),
+        });
+
+        let draw_slow = |cx: &mut VisualTestContext| {
+            let rendered_items = Rc::new(RefCell::new(Vec::new()));
+            cx.draw(
+                point(px(0.), px(0.)),
+                size(px(100.), px(20.)),
+                |_, cx| {
+                    let rendered_items = rendered_items.clone();
+                    let state = state.clone();
+                    struct SlowUnreadyListView {
+                        state: ListState,
+                        rendered_items: Rc<RefCell<Vec<usize>>>,
+                    }
+                    impl Render for SlowUnreadyListView {
+                        fn render(
+                            &mut self,
+                            _window: &mut Window,
+                            _cx: &mut Context<Self>,
+                        ) -> impl IntoElement {
+                            let rendered_items = self.rendered_items.clone();
+                            list(self.state.clone(), move |ix, _, _| {
+                                if ix == 1 || ix >= 4 {
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
+                                rendered_items.borrow_mut().push(ix);
+                                div().h(px(10.)).into_any()
+                            })
+                            .w_full()
+                            .h_full()
+                        }
+                    }
+                    cx.new(|_| SlowUnreadyListView {
+                        state,
+                        rendered_items,
+                    })
+                    .into_any_element()
+                },
+            );
+            rendered_items.take()
+        };
+
+        assert_eq!(draw_slow(cx), [2, 3, 1, 4]);
+        assert_eq!(state.0.borrow().items.summary().rendered_count, 3);
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 1);
+
+        assert_eq!(draw_slow(cx), [2, 3, 1, 5]);
+        assert_eq!(state.0.borrow().items.summary().rendered_count, 4);
         assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
     }
 
