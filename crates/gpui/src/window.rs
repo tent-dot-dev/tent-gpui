@@ -1324,7 +1324,8 @@ struct ModifierState {
 }
 
 /// Tracks input event timestamps to determine if input is arriving at a high rate.
-/// Used for selective VRR (Variable Refresh Rate) optimization.
+/// Used to hint higher display refresh rates and bypass inactive-window frame
+/// throttling during continuous gestures.
 #[derive(Clone, Debug)]
 pub(crate) struct InputRateTracker {
     timestamps: Vec<Instant>,
@@ -1392,6 +1393,26 @@ fn minimum_frame_interval(
     .into_iter()
     .flatten()
     .max()
+}
+
+fn tracks_high_rate_input(event: &PlatformInput) -> bool {
+    match event {
+        PlatformInput::Scroll(_)
+        | PlatformInput::Pinch(_)
+        | PlatformInput::Touch(_)
+        | PlatformInput::TouchDrag(_)
+        | PlatformInput::BackGesture(_) => true,
+        PlatformInput::MouseMove(mouse_move) => mouse_move.pressed_button.is_some(),
+        PlatformInput::KeyDown(_)
+        | PlatformInput::KeyUp(_)
+        | PlatformInput::ModifiersChanged(_)
+        | PlatformInput::MouseDown(_)
+        | PlatformInput::MouseUp(_)
+        | PlatformInput::MousePressure(_)
+        | PlatformInput::MouseExited(_)
+        | PlatformInput::LongPress(_)
+        | PlatformInput::FileDrop(_) => false,
+    }
 }
 
 impl Default for InputRateTracker {
@@ -1961,15 +1982,12 @@ impl Window {
                     })
                     .log_err();
 
-                // Keep presenting briefly after high-rate input to prevent display
-                // underclocking, but subject to the same power limits as redraws.
                 let has_next_frame_callbacks = !next_frame_callbacks.borrow().is_empty();
                 let has_frame_demand = invalidator.is_dirty()
                     || force_render
                     || has_next_frame_callbacks
                     || request_frame_options.require_presentation
-                    || needs_present.get()
-                    || high_rate_input;
+                    || needs_present.get();
 
                 let should_throttle = !request_frame_options.require_presentation;
                 let inactive_without_high_rate_input =
@@ -2046,9 +2064,8 @@ impl Window {
                 }
 
                 let should_draw = invalidator.is_dirty() || force_render;
-                let needs_present = request_frame_options.require_presentation
-                    || needs_present.get()
-                    || high_rate_input;
+                let needs_present =
+                    request_frame_options.require_presentation || needs_present.get();
                 if should_draw {
                     measure("frame duration", || {
                         handle
@@ -6099,7 +6116,7 @@ impl Window {
         self.promote_external_drag_to_platform(&event, cx);
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
-        if caused_invalidation {
+        if caused_invalidation && tracks_high_rate_input(&event) {
             self.input_rate_tracker.borrow_mut().record_input();
         }
         #[cfg(feature = "profiler")]
@@ -9139,6 +9156,132 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn test_high_rate_input_hints_without_redundant_presents(cx: &mut TestAppContext) {
+        use crate::{Modifiers, ScrollDelta, ScrollEvent, ScrollSource, TouchPhase};
+
+        struct InvalidatingInputView;
+
+        impl Render for InvalidatingInputView {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .on_mouse_move(cx.listener(|_, _, _, cx| cx.notify()))
+                    .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
+            }
+        }
+
+        cx.app.borrow_mut().mode = crate::app::GpuiMode::Production;
+        let window = cx.add_window(|_, _| InvalidatingInputView);
+        let mut test_window = cx.test_window(window.into());
+        test_window.simulate_active_status_change(true);
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        let position = point(px(10.), px(10.));
+        for _ in 0..8 {
+            test_window.simulate_input(PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            }));
+        }
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            !test_window.high_rate_hint(),
+            "hover mouse moves should not engage the high-rate display hint"
+        );
+
+        for _ in 0..8 {
+            test_window.simulate_input(PlatformInput::Scroll(ScrollEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-4.))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+                momentum_phase: None,
+                timestamp: None,
+                source: ScrollSource::Pointer,
+            }));
+        }
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            test_window.high_rate_hint(),
+            "high-rate scrolling should engage the high-rate display hint"
+        );
+        let draws_after_scroll = test_window.draw_count();
+        for _ in 0..3 {
+            test_window.simulate_frame_request(RequestFrameOptions::default());
+        }
+        assert!(
+            test_window.high_rate_hint(),
+            "clean frames should have run while high-rate sustain was still active"
+        );
+        assert_eq!(
+            test_window.draw_count(),
+            draws_after_scroll,
+            "clean frames during high-rate sustain must not redundantly present"
+        );
+
+        let inactive_window = cx
+            .app
+            .borrow_mut()
+            .open_window(
+                WindowOptions {
+                    inactive_frame_interval: Some(Duration::from_secs(3600)),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| InvalidatingInputView),
+            )
+            .expect("open inactive test window");
+        let mut inactive_test_window = cx.test_window(inactive_window.into());
+        inactive_test_window.simulate_active_status_change(false);
+        inactive_test_window.simulate_frame_request(RequestFrameOptions::default());
+        let draws_before_inactive_scroll = inactive_test_window.draw_count();
+        for _ in 0..8 {
+            inactive_test_window.simulate_input(PlatformInput::Scroll(ScrollEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.), px(-4.))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+                momentum_phase: None,
+                timestamp: None,
+                source: ScrollSource::Pointer,
+            }));
+        }
+        inactive_test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            !inactive_test_window.high_rate_hint(),
+            "inactive windows must not engage the high-rate display hint"
+        );
+        assert_eq!(
+            inactive_test_window.draw_count(),
+            draws_before_inactive_scroll + 1,
+            "high-rate scrolling in an inactive window should bypass inactive throttling"
+        );
+        inactive_test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(
+            inactive_test_window.draw_count(),
+            draws_before_inactive_scroll + 1,
+            "clean frames in an inactive window must not redundantly present"
+        );
+
+        let drag_window = cx.add_window(|_, _| InvalidatingInputView);
+        let mut drag_test_window = cx.test_window(drag_window.into());
+        drag_test_window.simulate_active_status_change(true);
+        drag_test_window.simulate_frame_request(RequestFrameOptions::default());
+        for _ in 0..8 {
+            drag_test_window.simulate_input(PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            }));
+        }
+        drag_test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            drag_test_window.high_rate_hint(),
+            "high-rate mouse drags should engage the high-rate display hint"
+        );
     }
 
     #[gpui::test]

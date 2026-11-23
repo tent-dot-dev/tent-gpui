@@ -299,8 +299,8 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
 ///
 /// The link pauses after any update in which GPUI neither drew, presented,
 /// nor asked for another frame, so an idle window acquires no drawables. GPUI
-/// decides when frames are needed (including presenting after high-rate
-/// input); this only stops the link between those decisions.
+/// decides when frames are needed; this only stops the link between those
+/// decisions.
 #[derive(Default)]
 pub struct MetalFrames {
     source: RefCell<Option<MetalFrameSource>>,

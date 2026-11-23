@@ -49,6 +49,8 @@ pub(crate) struct TestWindowState {
     appearance_change_callback: Option<Box<dyn FnMut()>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     frame_wake_count: Rc<Cell<usize>>,
+    draw_count: usize,
+    high_rate_hint: bool,
     frame_scheduled: bool,
     frame_callback_pending: bool,
     input_handler: Option<PlatformInputHandler>,
@@ -124,6 +126,8 @@ impl TestWindow {
             appearance_change_callback: None,
             request_frame_callback: None,
             frame_wake_count: Rc::new(Cell::new(0)),
+            draw_count: 0,
+            high_rate_hint: false,
             frame_scheduled: false,
             frame_callback_pending: false,
             input_handler: None,
@@ -280,6 +284,16 @@ impl TestWindow {
     /// Returns how many times this window's frame waker has been invoked.
     pub fn frame_wake_count(&self) -> usize {
         self.0.lock().frame_wake_count.get()
+    }
+
+    /// Returns how many times this window has presented a scene.
+    pub fn draw_count(&self) -> usize {
+        self.0.lock().draw_count
+    }
+
+    /// Returns the most recent high-rate display refresh hint.
+    pub fn high_rate_hint(&self) -> bool {
+        self.0.lock().high_rate_hint
     }
 
     /// Delivers a frame request to the window, as the platform's frame source
@@ -504,6 +518,10 @@ impl PlatformWindow for TestWindow {
         self.0.lock().request_frame_callback = Some(callback);
     }
 
+    fn set_high_rate_hint(&self, active: bool) {
+        self.0.lock().high_rate_hint = active;
+    }
+
     fn schedule_frame(&self) {
         let mut state = self.0.lock();
         if !state.frame_callback_pending {
@@ -558,6 +576,7 @@ impl PlatformWindow for TestWindow {
     fn draw(&self, scene: &Scene) {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();
+        state.draw_count += 1;
         state.frame_callback_pending = true;
         state.frame_scheduled = true;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
