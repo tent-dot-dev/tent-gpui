@@ -3034,12 +3034,9 @@ impl Interactivity {
                     let hitbox = hitbox.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
-                            let mut pending_mouse_down = pending_mouse_down.borrow_mut();
-                            if let Some(mouse_down) = pending_mouse_down.as_ref()
-                                && event.pressed_button != Some(mouse_down.button)
+                            if event.pressed_button.is_none()
+                                && pending_mouse_down.borrow_mut().take().is_some()
                             {
-                                pending_mouse_down.take();
-                                *clicked_state.borrow_mut() = ElementClickedState::default();
                                 window.refresh();
                             }
                             return;
@@ -3311,6 +3308,19 @@ impl Interactivity {
                 let active_state = active_state.clone();
                 window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
                     if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
+                        *active_state.borrow_mut() = ElementClickedState::default();
+                        window.refresh();
+                    }
+                });
+            }
+
+            {
+                let active_state = active_state.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, _cx| {
+                    if phase == DispatchPhase::Capture
+                        && event.pressed_button.is_none()
+                        && active_state.borrow().is_clicked()
+                    {
                         *active_state.borrow_mut() = ElementClickedState::default();
                         window.refresh();
                     }
@@ -5351,6 +5361,70 @@ mod tests {
             assert_eq!(hover_transitions.borrow().last().copied(), Some(true));
         })
         .unwrap();
+
+        // 3. A macOS Ctrl+Left aux-click (Right down/up with Left drag move) still completes.
+        let aux_clicks = Rc::new(Cell::new(0usize));
+        struct AuxClickView {
+            aux_clicks: Rc<Cell<usize>>,
+        }
+        impl Render for AuxClickView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let aux_clicks = self.aux_clicks.clone();
+                div().flex().size_full().child(
+                    div()
+                        .id("aux-click-target")
+                        .size(px(100.))
+                        .on_aux_click(move |_, _, _| {
+                            aux_clicks.set(aux_clicks.get() + 1);
+                        }),
+                )
+            }
+        }
+        let aux_window: AnyWindowHandle = cx
+            .add_window({
+                let aux_clicks = aux_clicks.clone();
+                move |_, _| AuxClickView { aux_clicks }
+            })
+            .into();
+        cx.update_window(aux_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: point(px(10.), px(10.)),
+                    button: MouseButton::Right,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(12.), px(12.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: point(px(12.), px(12.)),
+                    button: MouseButton::Right,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(aux_clicks.get(), 1);
     }
 
     struct MouseDownOutOwner {

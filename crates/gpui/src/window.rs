@@ -6321,6 +6321,7 @@ impl Window {
             && cx.has_active_drag()
         {
             cx.stop_active_drag(self);
+            cx.refresh_windows();
         }
 
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
