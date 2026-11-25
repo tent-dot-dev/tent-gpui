@@ -6315,6 +6315,14 @@ impl Window {
             return;
         }
 
+        if event
+            .downcast_ref::<MouseMoveEvent>()
+            .is_some_and(|mouse_move| mouse_move.pressed_button.is_none())
+            && cx.has_active_drag()
+        {
+            cx.stop_active_drag(self);
+        }
+
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for

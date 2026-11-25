@@ -3034,11 +3034,20 @@ impl Interactivity {
                     let hitbox = hitbox.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
+                            let mut pending_mouse_down = pending_mouse_down.borrow_mut();
+                            if let Some(mouse_down) = pending_mouse_down.as_ref()
+                                && event.pressed_button != Some(mouse_down.button)
+                            {
+                                pending_mouse_down.take();
+                                *clicked_state.borrow_mut() = ElementClickedState::default();
+                                window.refresh();
+                            }
                             return;
                         }
 
                         let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                         if let Some(mouse_down) = pending_mouse_down.clone()
+                            && event.pressed_button == Some(MouseButton::Left)
                             && !cx.has_active_drag()
                             && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
                             && let Some(listener) = drag_listener.take()
@@ -5228,6 +5237,120 @@ mod tests {
             .unwrap();
 
         assert!(active_tooltip.borrow().is_none());
+    }
+
+    #[gpui::test]
+    fn unpressed_mouse_move_clears_stale_drag_and_restores_hover(cx: &mut TestAppContext) {
+        struct DragAndHoverView {
+            hover_transitions: Rc<RefCell<Vec<bool>>>,
+        }
+
+        impl Render for DragAndHoverView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let hover_transitions = self.hover_transitions.clone();
+                div().flex().size_full().child(
+                    div()
+                        .id("draggable-hover-target")
+                        .size(px(100.))
+                        .on_drag((), |_, _, _, cx| cx.new(|_| crate::Empty))
+                        .on_hover(move |is_hovered, _, _| {
+                            hover_transitions.borrow_mut().push(*is_hovered);
+                        }),
+                )
+            }
+        }
+
+        let hover_transitions = Rc::new(RefCell::new(Vec::new()));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let hover_transitions = hover_transitions.clone();
+                move |_, _| DragAndHoverView { hover_transitions }
+            })
+            .into();
+
+        // 1. A MouseDown whose MouseUp is lost must not promote into an active drag on an unpressed move.
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: point(px(10.), px(10.)),
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(30.), px(30.)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(!cx.has_active_drag());
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+
+        // 2. A started drag whose MouseUp is lost is cleared on the next unpressed MouseMove and hover resumes.
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: point(px(10.), px(10.)),
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(30.), px(30.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.has_active_drag());
+            window.draw(cx).clear(cx);
+            // Hover is suppressed while dragging.
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(35.), px(35.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(hover_transitions.borrow().last().copied(), Some(false));
+
+            // MouseUp lost; next plain MouseMove clears the stuck drag and restores hover immediately.
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(40.), px(40.)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(!cx.has_active_drag());
+            assert_eq!(hover_transitions.borrow().last().copied(), Some(true));
+        })
+        .unwrap();
     }
 
     struct MouseDownOutOwner {
